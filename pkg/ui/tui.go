@@ -691,10 +691,8 @@ func (m mainModel) View() tea.View {
 	var sections []string
 
 	if !m.config.UI.HideHeader {
-		sections = append(sections, m.viewHeader())
+		sections = append(sections, m.viewHeader(), separator)
 	}
-
-	sections = append(sections, separator)
 	sections = append(sections, mainContent)
 
 	if !m.config.UI.HideFooter {
