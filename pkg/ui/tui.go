@@ -619,7 +619,9 @@ func (m mainModel) searchUpdate(msg tea.Msg) (mainModel, []tea.Cmd) {
 func (m mainModel) View() tea.View {
 	var view tea.View
 	view.AltScreen = true
-	view.MouseMode = tea.MouseModeAllMotion
+	if !m.config.UI.DisableMouse {
+		view.MouseMode = tea.MouseModeAllMotion
+	}
 
 	view.KeyboardEnhancements.ReportEventTypes = true
 	// Determine colors based on active panel.
