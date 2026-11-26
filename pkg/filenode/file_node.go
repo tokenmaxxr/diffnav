@@ -207,12 +207,17 @@ func DiffStats(file *gitdiff.File) (int64, int64) {
 }
 
 func ViewDiffStats(added, deleted int64, base lipgloss.Style) string {
+	theme := common.Themes.Current()
+	return ViewDiffStatsColored(added, deleted, base, theme.BrightGreen, theme.BrightRed)
+}
+
+// ViewDiffStatsColored is ViewDiffStats with the +/- colors given.
+func ViewDiffStatsColored(added, deleted int64, base lipgloss.Style, green, red color.Color) string {
 	addedView := ""
 	deletedView := ""
 
 	if added > 0 {
-		addedView = base.Foreground(common.Themes.Current().BrightGreen).
-			Render(fmt.Sprintf("+%d", added))
+		addedView = base.Foreground(green).Render(fmt.Sprintf("+%d", added))
 	}
 
 	if added > 0 && deleted > 0 {
@@ -220,8 +225,7 @@ func ViewDiffStats(added, deleted int64, base lipgloss.Style) string {
 	}
 
 	if deleted > 0 {
-		deletedView = base.Foreground(common.Themes.Current().BrightRed).
-			Render(fmt.Sprintf("-%d", deleted))
+		deletedView = base.Foreground(red).Render(fmt.Sprintf("-%d", deleted))
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, addedView, deletedView)

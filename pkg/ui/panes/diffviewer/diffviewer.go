@@ -2,8 +2,10 @@ package diffviewer
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -11,7 +13,9 @@ import (
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
+	"github.com/charmbracelet/x/ansi"
 
+	"github.com/dlvhdr/diffnav/pkg/config"
 	"github.com/dlvhdr/diffnav/pkg/filenode"
 	"github.com/dlvhdr/diffnav/pkg/icons"
 	"github.com/dlvhdr/diffnav/pkg/ui/common"
@@ -93,8 +97,54 @@ type Model struct {
 	sideBySide bool
 	// useUserDeltaTheme renders diffs with the user's own delta config instead of the theme.
 	useUserDeltaTheme bool
-	preamble          string
-	sb                common.Scrollbar
+	// themes maps a file extension (no dot) to its delta features and background.
+	themes map[string]config.ExtensionTheme
+	// panel holds the current file's background colors; nil without a background.
+	panel *panelColors
+	// vpStyles and fvpStyles are the viewport's and filter bar's default styles,
+	// restored for files without a background.
+	vpStyles  viewport.Styles
+	fvpStyles filterableviewport.Styles
+	preamble  string
+	sb        common.Scrollbar
+}
+
+// panelColors are a background and shades of it for the panel's own UI.
+type panelColors struct {
+	bg, fill, rule, text color.Color
+}
+
+func newPanelColors(hex string) *panelColors {
+	if hex == "" {
+		return nil
+	}
+	c := lipgloss.Color(hex)
+	return &panelColors{bg: c, fill: lipgloss.Darken(c, 0.1), rule: lipgloss.Darken(c, 0.25), text: lipgloss.Darken(c, 0.6)}
+}
+
+// extOf returns a path's extension without the dot, the key of the themes map.
+func extOf(path string) string {
+	return strings.TrimPrefix(filepath.Ext(path), ".")
+}
+
+// paintLines paints bg behind every line of text, also after each SGR reset so
+// text without its own background shows bg, and pads each line to a multiple of
+// width, so the rows of a line the viewport wraps (or cuts) are all filled.
+// Emoji presentation selectors (U+FE0F, as in ⚠️) are dropped: widths disagree
+// on them, which breaks the wrap early and leaves an unpainted row.
+func paintLines(text string, bg color.Color, width int) string {
+	r, g, b, _ := bg.RGBA()
+	seq := fmt.Sprintf("\x1b[48;2;%d;%d;%dm", r>>8, g>>8, b>>8)
+	lines := strings.Split(strings.ReplaceAll(text, "️", ""), "\n")
+	for i, line := range lines {
+		line = strings.ReplaceAll(line, "\x1b[0m", "\x1b[0m"+seq)
+		line = seq + strings.ReplaceAll(line, "\x1b[m", "\x1b[m"+seq)
+		if w := ansi.StringWidth(line); width > 0 && (w == 0 || w%width != 0) {
+			line += strings.Repeat(" ", width-w%width)
+		}
+		lines[i] = line + "\x1b[0m"
+	}
+	return strings.Join(lines, "\n")
 }
 
 // SetPreamble stores the preamble text (e.g. commit metadata from git show).
@@ -105,27 +155,29 @@ func (m *Model) SetPreamble(preamble string) {
 type ModelOpts struct {
 	SideBySide        bool
 	UseUserDeltaTheme bool
+	ExtensionThemes   map[string]config.ExtensionTheme
+	WrapLines         bool
 }
 
 func New(opts ModelOpts, styles *common.Styles) Model {
+	vpStyles := viewport.Styles{
+		SelectionPrefix: lipgloss.NewStyle().Foreground(styles.Tint.Blue).Render("▐"),
+		SelectedItemStyle: lipgloss.NewStyle().
+			Background(styles.Colors.SelectionBg).
+			Foreground(styles.Tint.BrightWhite),
+		FooterStyle: lipgloss.NewStyle().
+			BorderForeground(styles.Tint.BrightBlack).
+			Background(styles.Tint.BrightBlack).
+			Border(lipgloss.Border{Left: "", Right: ""}, false, true, false, true).
+			Foreground(styles.Tint.White).
+			Italic(true),
+	}
 	vp := viewport.New(
 		0,
 		0,
 		viewport.WithKeyMap[diffLine](ViewportKeyMap),
-		viewport.WithStyles[diffLine](
-			viewport.Styles{
-				SelectionPrefix: lipgloss.NewStyle().Foreground(styles.Tint.Blue).Render("▐"),
-				SelectedItemStyle: lipgloss.NewStyle().
-					Background(styles.Colors.SelectionBg).
-					Foreground(styles.Tint.BrightWhite),
-				FooterStyle: lipgloss.NewStyle().
-					BorderForeground(styles.Tint.BrightBlack).
-					Background(styles.Tint.BrightBlack).
-					Border(lipgloss.Border{Left: "", Right: ""}, false, true, false, true).
-					Foreground(styles.Tint.White).
-					Italic(true),
-			},
-		),
+		viewport.WithStyles[diffLine](vpStyles),
+		viewport.WithWrapText[diffLine](opts.WrapLines),
 	)
 
 	sb := common.Scrollbar{
@@ -208,6 +260,9 @@ func New(opts ModelOpts, styles *common.Styles) Model {
 		),
 		sideBySide:        opts.SideBySide,
 		useUserDeltaTheme: opts.UseUserDeltaTheme,
+		themes:            opts.ExtensionThemes,
+		vpStyles:          vpStyles,
+		fvpStyles:         filterableViewportStyles,
 		cache:             map[string]*cachedNode{},
 	}
 }
@@ -241,6 +296,26 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 const scrollbarWidth = 2 // 1 scrollbar character + 1 padding
 
+// updatePanelStyles sets the current file's panel colors and recolors the
+// footer pill, selected line and filter bar for them, or restores the defaults.
+func (m *Model) updatePanelStyles() {
+	m.panel = nil
+	if m.file != nil {
+		m.panel = newPanelColors(m.themes[extOf(m.file.path)].Background)
+	}
+	styles, fstyles := m.vpStyles, m.fvpStyles
+	if p := m.panel; p != nil {
+		styles.SelectedItemStyle = styles.SelectedItemStyle.Background(p.fill).Foreground(p.text)
+		styles.FooterStyle = styles.FooterStyle.BorderForeground(p.fill).Background(p.fill).Foreground(p.text)
+		fstyles.Filter.Focused.TextInput.Text = fstyles.Filter.Focused.TextInput.Text.Foreground(p.text)
+		fstyles.Filter.Unfocused.TextInput.Text = fstyles.Filter.Unfocused.TextInput.Text.Foreground(p.text)
+		fstyles.Filter.Empty = fstyles.Filter.Empty.Foreground(p.text)
+		fstyles.Match.Unfocused = fstyles.Match.Unfocused.Background(p.fill).Foreground(p.text)
+	}
+	m.fvp.SetViewportStyles(styles)
+	m.fvp.SetFilterableViewportStyles(fstyles)
+}
+
 func (m Model) View() string {
 	vpView := m.fvp.View()
 	itemMetrics := m.fvp.GetItemMetrics()
@@ -252,6 +327,10 @@ func (m Model) View() string {
 	)
 	if scrollbar != "" {
 		vpView = lipgloss.JoinHorizontal(lipgloss.Top, vpView, scrollbar)
+	}
+	if p := m.panel; p != nil {
+		vpView = lipgloss.NewStyle().Background(p.bg).Height(m.fvp.GetHeight()).
+			Render(paintLines(vpView, p.bg, m.Width))
 	}
 	return vpView
 }
@@ -328,20 +407,28 @@ func (m Model) headerView() string {
 	}
 	name := m.file.path
 	base := lipgloss.NewStyle()
+	var rule color.Color = m.Styles.Tint.Black
+	var green, red color.Color = m.Styles.Tint.BrightGreen, m.Styles.Tint.BrightRed
+	if p := m.panel; p != nil {
+		// The theme's bright green/red are too light on a light panel; darken them.
+		base, rule = base.Foreground(p.text), p.rule
+		green, red = lipgloss.Darken(green, 0.45), lipgloss.Darken(red, 0.45)
+	}
 
 	fileIcon := icons.GetIcon(name, false)
 	prefix := base.Render(fileIcon) + base.Render(" ")
 	name = utils.TruncateString(name, m.contentWidth()-lipgloss.Width(prefix))
 	top := prefix + base.Bold(true).Render(name)
 
-	bottom := filenode.ViewFileDiffStats(m.file.files[0], base)
+	added, deleted := filenode.DiffStats(m.file.files[0])
+	bottom := filenode.ViewDiffStatsColored(added, deleted, base, green, red)
 
 	return base.
 		Width(m.contentWidth()).
 		Height(dirHeaderHeight - 1).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderBottom(true).
-		BorderForeground(m.Styles.Tint.Black).
+		BorderForeground(rule).
 		Render(lipgloss.JoinVertical(lipgloss.Left, top, bottom))
 }
 
@@ -421,7 +508,10 @@ func (m Model) SetDirPatch(dirPath string, files []*gitdiff.File) (Model, tea.Cm
 	return m, m.diffDir(m.dir, m.contentWidth(), m.sideBySide, preamble)
 }
 
+// updateHeader runs whenever the shown file or directory changes, so it also
+// updates the panel colors and styles that depend on the file (header uses them).
 func (m *Model) updateHeader() {
+	m.updatePanelStyles()
 	m.fvp.SetHeader(strings.Split(m.headerView(), "\n"))
 }
 
@@ -475,21 +565,34 @@ func (m *Model) diffFile(node *cachedNode, width int) tea.Cmd {
 		IsNew:             file.IsNew,
 		IsDelete:          file.IsDelete,
 		UseUserDeltaTheme: m.useUserDeltaTheme,
+		Features:          m.themes[extOf(node.path)].DeltaFeatures,
 	}
 	args := m.makeDeltaArgs(opts)
-	env := makeDeltaEnv(opts)
 	return func() tea.Msg {
-		log.Info("executing delta", "cmd", fmt.Sprintf(`delta %s`, strings.Join(args, " ")))
-		deltac := exec.Command("delta", args...)
-		deltac.Env = env
-		deltac.Stdin = strings.NewReader(file.String() + "\n")
-		out, err := deltac.Output()
+		out, err := runDelta(args, opts, file.String()+"\n")
 		if err != nil {
-			return common.ErrMsg{Err: err}
+			return deltaErrMsg(err)
 		}
-
-		return diffContentMsg{cacheKey: key, node: node, lines: stringToDiffLines(string(out))}
+		return diffContentMsg{cacheKey: key, node: node, lines: stringToDiffLines(out)}
 	}
+}
+
+// runDelta renders a diff with delta.
+func runDelta(args []string, opts deltaOpts, input string) (string, error) {
+	log.Info("executing delta", "cmd", fmt.Sprintf(`delta %s`, strings.Join(args, " ")))
+	deltac := exec.Command("delta", args...)
+	deltac.Env = makeDeltaEnv(opts)
+	deltac.Stdin = strings.NewReader(input)
+	out, err := deltac.Output()
+	return string(out), err
+}
+
+func deltaErrMsg(err error) common.ErrMsg {
+	if stdErr, ok := err.(*exec.ExitError); ok {
+		return common.ErrMsg{Err: err, Message: string(stdErr.Stderr)}
+	}
+	log.Warn("delta error", "err", err)
+	return common.ErrMsg{Err: err}
 }
 
 func (m *Model) diffDir(dir *cachedNode, width int, sideBySide bool, preamble string) tea.Cmd {
@@ -497,32 +600,50 @@ func (m *Model) diffDir(dir *cachedNode, width int, sideBySide bool, preamble st
 		return nil
 	}
 	key := cacheKey(dir.path, sideBySide)
-	opts := deltaOpts{
-		SideBySide:        sideBySide,
-		Width:             width,
-		UseUserDeltaTheme: m.useUserDeltaTheme,
+
+	// Files whose extension has a theme (e.g. light markdown) are rendered in
+	// separate delta runs, one per run of consecutive files sharing a theme, and
+	// their lines get its background. Without themed files this is one delta run.
+	type group struct {
+		theme config.ExtensionTheme
+		input strings.Builder
 	}
-	args := m.makeDeltaArgs(opts)
-	env := makeDeltaEnv(opts)
-	return func() tea.Msg {
-		log.Info("executing delta", "cmd", fmt.Sprintf(`delta %s`, strings.Join(args, " ")))
-		deltac := exec.Command("delta", args...)
-		deltac.Env = env
-		strs := strings.Builder{}
-		for _, file := range dir.files {
-			strs.WriteString(file.String())
+	var groups []*group
+	for _, file := range dir.files {
+		theme := m.themes[extOf(filenode.GetFileName(file))]
+		if n := len(groups); n == 0 || groups[n-1].theme != theme {
+			groups = append(groups, &group{theme: theme})
 		}
-		deltac.Stdin = strings.NewReader(strs.String() + "\n")
-		out, err := deltac.Output()
-		if err != nil {
-			if stdErr, ok := err.(*exec.ExitError); ok {
-				return common.ErrMsg{Err: err, Message: string(stdErr.Stderr)}
+		groups[len(groups)-1].input.WriteString(file.String())
+	}
+	if len(groups) == 0 {
+		groups = append(groups, &group{})
+	}
+
+	return func() tea.Msg {
+		var rendered strings.Builder
+		for i, g := range groups {
+			opts := deltaOpts{
+				SideBySide:        sideBySide,
+				Width:             width,
+				UseUserDeltaTheme: m.useUserDeltaTheme,
+				Features:          g.theme.DeltaFeatures,
 			}
-			log.Warn("delta error", "err", err)
-			return common.ErrMsg{Err: err}
+			input := g.input.String()
+			if i == len(groups)-1 {
+				input += "\n"
+			}
+			out, err := runDelta(m.makeDeltaArgs(opts), opts, input)
+			if err != nil {
+				return deltaErrMsg(err)
+			}
+			if p := newPanelColors(g.theme.Background); p != nil {
+				out = paintLines(strings.TrimSuffix(out, "\n"), p.bg, width) + "\n"
+			}
+			rendered.WriteString(out)
 		}
 
-		text := string(out)
+		text := rendered.String()
 		if preamble != "" {
 			text = m.renderPreamble(preamble) + "\n" + text
 		}
@@ -621,10 +742,13 @@ type deltaOpts struct {
 	SideBySide        bool
 	Width             int
 	UseUserDeltaTheme bool
+	// Features are extra delta features (deltaFeaturesByExtension) for this diff.
+	Features string
 }
 
 // makeDeltaEnv sets side-by-side like `git -c delta.side-by-side=...` would.
 // The --side-by-side flag would override the user's line-number format and can't turn it off.
+// Extra features are added after the user's own through DELTA_FEATURES ("+" keeps the configured ones).
 func makeDeltaEnv(opts deltaOpts) []string {
 	env := os.Environ()
 	if !opts.UseUserDeltaTheme {
@@ -634,7 +758,15 @@ func makeDeltaEnv(opts deltaOpts) []string {
 	if prev := os.Getenv("GIT_CONFIG_PARAMETERS"); prev != "" {
 		param = prev + " " + param
 	}
-	return append(env, "GIT_CONFIG_PARAMETERS="+param)
+	env = append(env, "GIT_CONFIG_PARAMETERS="+param)
+	if opts.Features != "" {
+		features := "+" + opts.Features
+		if prev := os.Getenv("DELTA_FEATURES"); prev != "" {
+			features = prev + " " + opts.Features
+		}
+		env = append(env, "DELTA_FEATURES="+features)
+	}
+	return env
 }
 
 func (m *Model) makeDeltaArgs(opts deltaOpts) []string {

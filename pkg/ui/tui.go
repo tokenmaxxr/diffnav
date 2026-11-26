@@ -150,6 +150,8 @@ func New(opts ModelOpts, cfg config.Config) mainModel {
 		diffviewer.ModelOpts{
 			SideBySide:        cfg.UI.SideBySide,
 			UseUserDeltaTheme: cfg.UI.UseUserDeltaTheme,
+			ExtensionThemes:   cfg.UI.ExtensionThemes,
+			WrapLines:         cfg.UI.WrapLines,
 		},
 		&m.styles,
 	)

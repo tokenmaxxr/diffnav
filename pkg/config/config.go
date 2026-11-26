@@ -24,6 +24,15 @@ type UIConfig struct {
 	Theme                 string `yaml:"theme"`                 // The theme to use (default: "tokyo_night")
 	UseUserDeltaTheme     bool   `yaml:"useUserDeltaTheme"`     // Use the user's delta config for diffs (default: false)
 	DisableMouse          bool   `yaml:"disableMouse"`          // Leave the mouse to the terminal/tmux, e.g. for drag-to-select (default: false)
+	WrapLines             bool   `yaml:"wrapLines"`             // Wrap long diff lines instead of cutting them at the panel edge (default: false)
+	// Per file extension (no dot), e.g. a light theme for md (needs useUserDeltaTheme).
+	ExtensionThemes map[string]ExtensionTheme `yaml:"extensionThemes"`
+}
+
+// ExtensionTheme renders one extension's diffs differently.
+type ExtensionTheme struct {
+	DeltaFeatures string `yaml:"deltaFeatures"` // Extra delta features, added through DELTA_FEATURES
+	Background    string `yaml:"background"`    // Hex background behind its diff, matching those features
 }
 
 type WatchConfig struct {
